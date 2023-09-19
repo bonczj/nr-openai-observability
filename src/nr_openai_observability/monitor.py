@@ -1,14 +1,18 @@
 import atexit
+from datetime import datetime
+import json
 import inspect
 import logging
 import os
 import sys
 import time
+import traceback
 import uuid
 from argparse import ArgumentError
 from typing import Any, Dict, List, Optional
 
 import openai
+import botocore
 from newrelic_telemetry_sdk import (Event, EventBatch, EventClient, Harvester,
                                     Span, SpanBatch, SpanClient)
 
@@ -384,19 +388,6 @@ def patcher_create_completion(original_fn, *args, **kwargs):
 
 @handle_errors
 def handle_create_completion(response, time_delta, **kwargs):
-    def flatten_dict(dd, separator=".", prefix="", index=""):
-        if len(index):
-            index = index + separator
-        return (
-            {
-                prefix + separator + index + k if prefix else k: v
-                for kk, vv in dd.items()
-                for k, v in flatten_dict(vv, separator, kk).items()
-            }
-            if isinstance(dd, dict)
-            else {prefix: dd}
-        )
-
     choices_payload = {}
     for i, choice in enumerate(response.get("choices")):
         choices_payload.update(flatten_dict(choice, prefix="choices", index=str(i)))
@@ -418,6 +409,195 @@ def handle_create_completion(response, time_delta, **kwargs):
     monitor.record_event(event_dict)
 
     return response
+
+
+def flatten_dict(dd, separator=".", prefix="", index=""):
+    if len(index):
+        index = index + separator
+    return (
+        {
+            prefix + separator + index + k if prefix else k: v
+            for kk, vv in dd.items()
+            for k, v in flatten_dict(vv, separator, kk).items()
+        }
+        if isinstance(dd, dict)
+        else {prefix: dd}
+    )
+
+
+def patcher_bedrock_create_completion(original_fn, *args, **kwargs):
+    logger.info(
+        f"Running the original function: '{original_fn.__qualname__}'. args:{args}; kwargs: {kwargs}"
+    )
+
+    timestamp = time.time()
+    result, time_delta = None, None
+
+    try:
+        result = original_fn(*args, **kwargs)
+        time_delta = time.time() - timestamp
+
+        logger.info(f"Finished running function: '{original_fn.__qualname__}' in {time_delta}.")
+        logger.info(f"Josh ---  returned result '${result}'")
+    except Exception as error:
+        logger.error(f"error invoking bedrock function: {error}")
+        return result
+
+    # print the HTTP body
+    from botocore.response import StreamingBody
+    from io import BytesIO
+
+    contents = result['body'].read()
+    bio = BytesIO(contents)
+    result['body'] = StreamingBody(bio, len(contents))
+    logger.info(f'Josh --- result body {contents}')
+
+    handle_bedrock_create_completion(result, time_delta, **kwargs)
+
+    # we have to reset the body after we read it. The handle function is going to read the contents,
+    # and we'll have to apply the body again before returning back.
+    bio = BytesIO(contents)
+    result['body'] = StreamingBody(bio, len(contents))
+    return result
+
+
+def patcher_aws_create_api(original_fn, *args, **kwargs):
+    # We are in the AWS API to create a new object, we need to invoke that first!
+    try:
+        from botocore.model import ServiceModel
+        logger.info(f'Josh --- invoking method {original_fn} with args {args}, kwargs {kwargs}')
+        response = original_fn(*args, **kwargs)
+        logger.info(f'Josh --- original_fn {original_fn} returned {response}')
+
+        cls = type(response)
+        name = cls.__qualname__
+        if cls.__module__ is not None and cls.__module__ != '__builtin__':
+            name = f'{cls.__module__}.{cls.__qualname__}'
+
+        logger.info(f'Josh --- returned object is of type {name}')
+
+        if name == 'botocore.client.Bedrock':
+            bedrock_method = 'invoke_model'
+            logger.info(f'Josh --- instrument bedrock class {bedrock_method}!')
+            original_invoke_model = getattr(response, bedrock_method)
+
+            if original_invoke_model is not None:
+                logger.info(f"Josh --- found method '{bedrock_method}' on {response}")
+                setattr(response, bedrock_method, _patched_call(
+                    original_invoke_model, 
+                    patcher_bedrock_create_completion
+                ))
+            else:
+                logger.error(f"failed to find method '{bedrock_method}' on {response}")
+
+        return response
+
+    except BaseException as error:
+        logger.error(f'caught exception trying to invoke original function: {error}')
+        raise error
+
+def bind__create_api_method(py_operation_name, operation_name, service_model,
+        *args, **kwargs):
+    return (py_operation_name, service_model)
+
+
+@handle_errors
+def handle_bedrock_create_completion(response, time_delta, **kwargs):
+    try:
+        contents = response['body'].read()
+        logger.info(f'handle_bedrock_create_completion: response {response},\n\ttime_delta {time_delta},\n\tkwargs {kwargs},\n\tcontents {contents}')
+        response_body = json.loads(contents)
+
+        event_dict = {
+            **kwargs,
+            "response_time": time_delta,
+            **flatten_dict(response_body, separator="."),
+            'vendor': 'bedrock',
+        }
+
+        if 'credentials' in event_dict:
+            event_dict.pop('credentials')
+
+        max_tokens = 0
+
+        # convert body from a str to a json dictionary
+        if 'body' in event_dict and type(event_dict['body']) is str:
+            body = json.loads(event_dict['body'])
+            event_dict['body'] = body
+
+        if 'body' in event_dict['body'] and 'max_tokens_to_sample' in event_dict['body']:
+            max_tokens = event_dict['body']['max_tokens_to_sample']
+
+        tokens = max_tokens
+
+
+        completion_id = str(uuid.uuid4())
+        model = event_dict['modelId'] or "bedrock-unknown"
+        temperature = 0
+
+        if 'temperature' in event_dict['body']:
+            temperature = event_dict['body']['temperature']
+
+        logger.info(f'\n\nevent_dict = {event_dict}')
+
+        # build out the input and output messages for this request
+        message_id = str(uuid.uuid4())
+        events = []
+
+        # prompt input. Will need to parse later to grab the human input
+        index = 0
+        events.append({ # prompts + user request / input
+                "id": message_id,
+                "content": (str(event_dict['body']['prompt']) or "")[:4095],
+                "role": 'system',
+                "completion_id": completion_id,
+                "sequence": index,
+                "model": model,
+                "vendor": "bedrock",
+                "ingest_source": "PythonSDK",
+        })
+        index += 1
+        events.append({ # LLM response / completion
+            "id": message_id,
+            "content": (response_body['completion'] or "")[:4095],
+            "role": 'assistant',
+            "completion_id": completion_id,
+            "sequence": index,
+            "model": model,
+            "vendor": "bedrock",
+            "ingest_source": "PythonSDK",
+        })
+
+        completion = {
+            "id": completion_id,
+            # "api_key_last_four_digits": f"sk-{response.api_key[-4:]}",
+            "timestamp": datetime.now(),
+            "response_time": int(time_delta * 1000),
+            "request.model": model,
+            "response.model": model,
+            "usage.completion_tokens": tokens,
+            "usage.total_tokens": max_tokens,
+            "usage.prompt_tokens": None,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "finish_reason": event_dict['stop_reason'] or None,
+            "api_type": None,
+            "vendor": "bedrock",
+            "ingest_source": "PythonSDK",
+            "number_of_messages": len(events), 
+            # "organization": response.organization,
+            # "api_version": response_headers.get("openai-version"),
+        }
+
+        logger.info(f"Bedrock Reported event dictionary:\n{event_dict}")
+        logger.info(f'Bedrock summary event: {completion}')
+        for event in events:
+            monitor.record_event(event, MessageEventName)
+        monitor.record_event(completion, SummeryEventName)
+    except Exception as error:
+        stacks = traceback.format_exception(error)
+        logger.error(f'error writing bedrock event summary: {error}')
+        logger.error(stacks)
 
 
 def patcher_create_embedding(original_fn, *args, **kwargs):
@@ -579,6 +759,14 @@ def perform_patch():
         )
     except AttributeError:
         pass
+
+    try:
+        logger.info('Josh --- Attempting to patch Bedrock invoke_model')
+        botocore.client.ClientCreator.create_client = _patched_call(
+            botocore.client.ClientCreator.create_client, patcher_aws_create_api
+        )
+    except AttributeError as error:
+        logger.error(f'failed to instrument botocore.client.ClientCreator.create_client: {error}')
 
     if "langchain" in sys.modules:
         perform_patch_langchain_vectorstores()
