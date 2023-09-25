@@ -673,6 +673,120 @@ def handle_create_embedding(response, request, error, response_time):
     return response
 
 
+def patcher_run_chain(original_fn, *args, **kwargs):
+    from langchain.callbacks.manager import CallbackManager
+    from nr_openai_observability.langchain_callback import NewRelicCallbackHandler
+
+    logger.debug(
+        f"Running the original function: '{original_fn.__qualname__}'. args:{args}; kwargs: {kwargs}"
+    )
+    logger.debug(f"LangChain Chain input: args = {args}, kwargs = {kwargs}")
+
+    # Create a NR LangChain callback if one does not already exist within the callbacks/Manager
+    nrCallback = None
+    (api_key, model, temperature, max_tokens, vendor) = (None, None, None, None, None)
+
+    for x in args:
+        logger.debug(f"\ttype {type(x)}")
+
+        if hasattr(x, 'agent'):
+            agent = x.agent
+            logger.debug(f"\tagent = {agent}")
+
+            if hasattr(agent, "llm_chain") and hasattr(getattr(agent, "llm_chain"), "callbacks"):
+                callbacks = getattr(getattr(agent, "llm_chain"), "callbacks")
+
+                # does not work yet
+                if isinstance(callbacks, CallbackManager):
+                    for handler in callbacks.handlers:
+                        if isinstance(handler, NewRelicCallbackHandler):
+                            nrCallback = handler
+                            break
+
+                    if nrCallback is None:
+                        logger.warning("using langchain but have not instrumented the NewRelicCallbackHandler")
+                    else:
+                        logger.debug(f"found {nrCallback}!")
+
+            if hasattr(agent, "llm_chain"):
+                llm_chain = getattr(agent, "llm_chain")
+                logger.debug(f"found llm_chain = {llm_chain}")
+
+                if hasattr(llm_chain, "llm"):
+                    llm = getattr(llm_chain, "llm")
+                    logger.debug(f"found llm = {llm}")
+                    (api_key, model, temperature, max_tokens, vendor) = process_langchain_llm(llm)
+
+    result, time_delta = None, None
+    completion_id = str(uuid.uuid4())
+    completion = {
+        "id": completion_id,
+        "model_name": model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "vendor": vendor,
+        "ingest_source": "PythonSDK",
+        "message": kwargs['input'],
+    }
+
+    if api_key is not None:
+        completion["api_key_last_four_digits"] = f"sk-{api_key[-4:]}"
+
+    try:
+        timestamp = time.time()
+        result = original_fn(*args, **kwargs)
+        time_delta = time.time() - timestamp
+
+        completion["response_time"] = int(time_delta * 1000)
+        completion["response"] = result
+    except Exception as ex:
+        completion["response"] = str(ex)
+        completion["has_error"] = True
+        raise ex
+    finally:
+        monitor.record_event(completion, EventName)
+
+    logger.debug(f"Finished running function: '{original_fn.__qualname__}'.")
+    logger.debug(f"LangChain Chain output: result = {result}")
+
+    return result
+
+
+def process_langchain_llm(llm):
+    """
+    Based on the type of llm object, return the following data
+
+        (api_key, model, temperature, max_tokens, vendor)
+    """
+    from langchain.chat_models import (BedrockChat, ChatOpenAI)
+    from langchain.llms.bedrock import (Bedrock)
+    from langchain.llms.openai import (BaseOpenAI, OpenAIChat)
+
+    (api_key, model, temperature, max_tokens, vendor) = (None, None, None, None, None)
+
+    if isinstance(llm, BaseOpenAI):
+        api_key = llm.openai_api_key
+        model = llm.model_name
+        temperature = llm.temperature
+        max_tokens = llm.max_tokens
+        vendor = "OpenAI"
+    elif isinstance(llm, OpenAIChat) or isinstance(llm, ChatOpenAI):
+        api_key = llm.openai_api_key
+        model = llm.model_name
+        vendor = "OpenAI"
+    elif isinstance(llm, Bedrock) or isinstance(llm, BedrockChat):
+        model = llm.model_id
+        vendor = "Bedrock"
+
+        if 'temperature' in llm.model_kwargs:
+            temperature = llm.model_kwargs['temperature']
+        if 'max_tokens_to_sample' in llm.model_kwargs:
+            max_tokens = llm.model_kwargs["max_tokens_to_sample"]
+        
+    logger.info(f"process_langchain_llm: api_key = {api_key}, model = {model}, temp = {temperature}, max_tokens = {max_tokens}, vendor = {vendor}")
+    return (api_key, model, temperature, max_tokens, vendor)
+
+
 monitor = OpenAIMonitoring()
 
 
@@ -708,6 +822,15 @@ def perform_patch_langchain_vectorstores():
             )
         except AttributeError:
             pass
+
+    try:
+        from langchain.chains.base import Chain
+        # from langchain.chains import LLMChain
+        langchain.chains.base.Chain.run = _patched_call(
+            langchain.chains.base.Chain.run, patcher_run_chain
+        )
+    except AttributeError:
+        pass
 
 
 def perform_patch():
