@@ -88,6 +88,11 @@ class NewRelicCallbackHandler(BaseCallbackHandler):
                         "token_usage"
                     ).completion_tokens,
                     "total_tokens": response.llm_output.get("token_usage").total_tokens,
+                    "toxicity": random.random(),
+                    "fluency": random.random(),
+                    "relevence": random.random(),
+                    "grounded_in_context": random.random(),
+                    "avoided_answer": random.random(),
                 }
             )
         span = self.spans_stack.pop()
